@@ -25,47 +25,45 @@ IMAGE_HEIGHT = 160  # 1280 originally
 IMAGE_WIDTH = 240  # 1918 originally
 PIN_MEMORY = True
 LOAD_MODEL = False
-TRAIN_IMG_DIR = '/Users/atreyasridharan/Desktop/BCCD/train/original'
-TRAIN_MASK_DIR = '/Users/atreyasridharan/Desktop/BCCD/train/mask'
-VAL_IMG_DIR = '/Users/atreyasridharan/Desktop/BCCD/test/original'
+TRAIN_IMG_DIR = '/home/axs2220/Math473_Final/Dataset/BCCD/train/original'
+TRAIN_MASK_DIR = '/home/axs2220/Math473_Final/Dataset/BCCD/train/mask'
+VAL_IMG_DIR = '/home/axs2220/Math473_Final/Dataset/BCCD/test/original'
 
-def train_fn(loader, model, optimizer, loss_fn, scaler):
+def train_fn(loader, model, optimizer, loss_fn):  # Removed scaler
     loop = tqdm(loader)
-
     for batch_idx, (data, targets) in enumerate(loop):
         data = data.to(device=DEVICE)
         targets = targets.float().unsqueeze(1).to(device=DEVICE)
 
-        # forward
-        with torch.cuda.amp.autocast():
-            predictions = model(data)
-            loss = loss_fn(predictions, targets)
+        # Forward pass
+        predictions = model(data)
+        loss = loss_fn(torch.sigmoid(predictions), targets)
 
-        # backward
+        # Backward pass
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        optimizer.step()
 
-        # update tqdm loop
+        # Update tqdm loop
         loop.set_postfix(loss=loss.item())
 
 
+        
 def main():
     train_transform = A.Compose(
         [
-            A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
-            A.Rotate(limit=35, p=1.0),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.1),
-            A.Normalize(
-                mean=[0.0, 0.0, 0.0],
-                std=[1.0, 1.0, 1.0],
-                max_pixel_value=255.0,
-            ),
-            ToTensorV2(),
-        ],
-    )
+         A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
+         A.Rotate(limit=35, p=1.0),
+         A.HorizontalFlip(p=0.5),
+         A.VerticalFlip(p=0.1),
+         A.Normalize(
+             mean=[0.5, 0.5, 0.5],  # Adjusted mean
+             std=[0.5, 0.5, 0.5],    # Adjusted std
+             max_pixel_value=255.0,
+             ),
+             ToTensorV2(),
+             ],
+             )
 
     val_transforms = A.Compose(
         [
@@ -79,9 +77,12 @@ def main():
         ],
     )
 
-    model = TVRegularizedUNet (in_channels=3, out_channels=1).to(DEVICE)
+    model = TVRegularizedUNet(in_channels=3, out_channels=1).to(DEVICE)
+    
+    # Define loss function
     loss_fn = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     train_loader = get_train_loader(
         TRAIN_IMG_DIR,
@@ -100,11 +101,31 @@ def main():
         PIN_MEMORY,
     )
 
-    scaler = torch.cuda.amp.GradScaler()
+
+    
+    
+    print(f"Total training samples: {len(train_loader.dataset)}")
+    print(f"Total validation samples: {len(val_loader.dataset)}")
+
+    # Verify a batch of data
+    for batch_idx, (images, masks) in enumerate(train_loader):
+        print(f"Batch {batch_idx}")
+        print(f"Images shape: {images.shape}")
+        print(f"Masks shape: {masks.shape}")
+        print(f"Images dtype: {images.dtype}")
+        print(f"Masks dtype: {masks.dtype}")
+        
+        # Check for any NaNs or infs
+        print(f"Images NaNs: {torch.isnan(images).any()}")
+        print(f"Masks NaNs: {torch.isnan(masks).any()}")
+        print(f"Images infs: {torch.isinf(images).any()}")
+        print(f"Masks infs: {torch.isinf(masks).any()}")
+        
+        break  # Just check the first batch
 
     # Training loop
     for epoch in range(NUM_EPOCHS):
-        train_fn(train_loader, model, optimizer, loss_fn, scaler)
+        train_fn(train_loader, model, optimizer, loss_fn)
 
         # Save model checkpoint
         checkpoint = {
@@ -117,6 +138,7 @@ def main():
         save_predictions_as_imgs(
             val_loader, model, folder=f"saved_images/epoch_{epoch}/", device=DEVICE
         )
+        
 
 if __name__ == "__main__":
     main()
