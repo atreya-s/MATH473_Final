@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import LBFGS
 
 def total_variation_loss(A):
     """
@@ -32,35 +33,20 @@ def regularized_softmax(omega, lam):
     """
     # Solve the optimization problem in Equation (3.6)
     A = omega.clone().detach().requires_grad_()
-    optimizer = torch.optim.Adam([A], lr=1e-3)
-    
-    for _ in range(100):
-        optimizer.zero_grad()
-        loss = -torch.sum(A * torch.log(A + 1e-8)) + lam * torch.norm(A, p=1)
-        loss.backward()
-        optimizer.step()
-        A.data.clamp_(min=0)
-        A.data /= A.sum(dim=1, keepdim=True)
-    
-    return A
+    optimizer = LBFGS([A], lr=1e-3)
 
-def regularized_relu(omega):
-    """
-    Compute the Regularized ReLU activation function.
-    
-    Args:
-    omega (torch.Tensor): Input logits
-    
-    Returns:
-    torch.Tensor: Regularized ReLU activations
-    """
-    # Compute the closed-form solution in Equation (3.11)
-    A = torch.max(torch.zeros_like(omega), omega)
-    return A
+    def closure():
+        optimizer.zero_grad()
+        loss = -torch.sum(A * torch.log(F.softmax(A, dim=1) + 1e-8)) + lam * torch.norm(A, p=1)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return F.softmax(A, dim=1)
 
 class TVRegularizedUNet(nn.Module):
     """
-    U-Net architecture with integrated Total Variation regularization
+    U-Net architecture with integrated Total Variation and Regularized Softmax regularization
     """
     def __init__(self, in_channels=1, out_channels=1, tv_weight=0.1, softmax_weight=0.1):
         """
@@ -150,13 +136,11 @@ class TVRegularizedUNet(nn.Module):
         dec1 = torch.cat((dec1, enc1), dim=1)
         dec1 = self.dec1(dec1)
         
-        # Final convolution
+        # Final convolution and Regularized Softmax
         logits = self.final_conv(dec1)
+        output = regularized_softmax(logits, self.softmax_weight)
         
-        # Apply Regularized Softmax
-        softmax_output = regularized_softmax(logits, self.softmax_weight)
-        
-        return softmax_output
+        return output
     
     def compute_loss(self, output, target, criterion=nn.MSELoss()):
         """
@@ -231,3 +215,4 @@ if __name__ == "__main__":
     # Optimizer (example)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
+   
