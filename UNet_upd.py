@@ -2,38 +2,79 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def total_variation_loss(img):
+def total_variation_loss(A):
     """
-    Compute Total Variation (TV) loss for 2D images.
+    Compute Total Variation (TV) loss for a set of activation maps.
     
     Args:
-    img (torch.Tensor): Input image tensor of shape (B, C, H, W)
+    A (torch.Tensor): Activation maps of shape (B, C, H, W)
     
     Returns:
     torch.Tensor: Total Variation loss
     """
     # Compute vertical and horizontal differences
-    diff_vert = torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :]).sum()
-    diff_horz = torch.abs(img[:, :, :, 1:] - img[:, :, :, :-1]).sum()
+    diff_vert = torch.abs(A[:, :, 1:, :] - A[:, :, :-1, :]).sum()
+    diff_horz = torch.abs(A[:, :, :, 1:] - A[:, :, :, :-1]).sum()
     
     # Return total variation
-    return (diff_vert + diff_horz) / (img.shape[0] * img.shape[1])
+    return (diff_vert + diff_horz) / (A.shape[0] * A.shape[1])
+
+def regularized_softmax(omega, lam):
+    """
+    Compute the Regularized Softmax activation function.
+    
+    Args:
+    omega (torch.Tensor): Input logits
+    lam (float): Regularization parameter
+    
+    Returns:
+    torch.Tensor: Regularized Softmax activations
+    """
+    # Solve the optimization problem in Equation (3.6)
+    A = omega.clone().detach().requires_grad_()
+    optimizer = torch.optim.Adam([A], lr=1e-3)
+    
+    for _ in range(100):
+        optimizer.zero_grad()
+        loss = -torch.sum(A * torch.log(A + 1e-8)) + lam * torch.norm(A, p=1)
+        loss.backward()
+        optimizer.step()
+        A.data.clamp_(min=0)
+        A.data /= A.sum(dim=1, keepdim=True)
+    
+    return A
+
+def regularized_relu(omega):
+    """
+    Compute the Regularized ReLU activation function.
+    
+    Args:
+    omega (torch.Tensor): Input logits
+    
+    Returns:
+    torch.Tensor: Regularized ReLU activations
+    """
+    # Compute the closed-form solution in Equation (3.11)
+    A = torch.max(torch.zeros_like(omega), omega)
+    return A
 
 class TVRegularizedUNet(nn.Module):
     """
     U-Net architecture with integrated Total Variation regularization
     """
-    def __init__(self, in_channels=1, out_channels=1, tv_weight=0.1):
+    def __init__(self, in_channels=1, out_channels=1, tv_weight=0.1, softmax_weight=0.1):
         """
         Args:
         in_channels (int): Number of input channels
         out_channels (int): Number of output channels
         tv_weight (float): Weight for Total Variation regularization
+        softmax_weight (float): Weight for Regularized Softmax regularization
         """
         super(TVRegularizedUNet, self).__init__()
         
-        # Total Variation regularization weight
+        # Regularization weights
         self.tv_weight = tv_weight
+        self.softmax_weight = softmax_weight
         
         # Encoder (Downsampling)
         self.enc1 = self._block(in_channels, 64)
@@ -75,7 +116,7 @@ class TVRegularizedUNet(nn.Module):
     
     def forward(self, x):
         """
-        Forward pass with Total Variation regularization
+        Forward pass with Total Variation and Regularized Softmax regularization
         
         Args:
         x (torch.Tensor): Input image tensor
@@ -110,13 +151,16 @@ class TVRegularizedUNet(nn.Module):
         dec1 = self.dec1(dec1)
         
         # Final convolution
-        output = self.final_conv(dec1)
+        logits = self.final_conv(dec1)
         
-        return output
+        # Apply Regularized Softmax
+        softmax_output = regularized_softmax(logits, self.softmax_weight)
+        
+        return softmax_output
     
     def compute_loss(self, output, target, criterion=nn.MSELoss()):
         """
-        Compute loss with Total Variation regularization
+        Compute loss with Total Variation and Regularized Softmax regularization
         
         Args:
         output (torch.Tensor): Network prediction
@@ -133,7 +177,7 @@ class TVRegularizedUNet(nn.Module):
         tv_loss = total_variation_loss(output)
         
         # Combined loss
-        total_loss = base_loss + self.tv_weight * tv_loss
+        total_loss = base_loss + self.tv_weight * tv_loss + self.softmax_weight * tv_loss
         
         return total_loss
 
@@ -156,7 +200,7 @@ def train_unet(model, train_loader, optimizer, epochs=10):
             # Forward pass
             output = model(data)
             
-            # Compute loss (including TV regularization)
+            # Compute loss (including regularization)
             loss = model.compute_loss(output, target)
             
             # Backward pass and optimization
@@ -174,13 +218,16 @@ if __name__ == "__main__":
     in_channels = 1  # e.g., grayscale image
     out_channels = 1  # e.g., binary segmentation
     tv_weight = 0.1  # Total Variation regularization strength
+    softmax_weight = 0.1  # Regularized Softmax regularization strength
     
     # Initialize model
     model = TVRegularizedUNet(
         in_channels=in_channels, 
         out_channels=out_channels, 
-        tv_weight=tv_weight
+        tv_weight=tv_weight,
+        softmax_weight=softmax_weight
     )
     
     # Optimizer (example)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
