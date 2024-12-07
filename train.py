@@ -4,141 +4,149 @@ from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
-from model import TVRegularizedUNet 
+from model import RegularizedUNet  # Updated model import
 from utils import (
     load_checkpoint,
     save_checkpoint,
-    get_loaders,
-    check_accuracy,
-    save_predictions_as_imgs,
     get_train_loader,
     get_val_loader,
+    check_accuracy,
+    save_predictions_as_imgs,
 )
 
-# Hyperparameters etc.
+# Hyperparameters
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 16
-NUM_EPOCHS = 3
+NUM_EPOCHS = 50
 NUM_WORKERS = 2
-IMAGE_HEIGHT = 160  # 1280 originally
-IMAGE_WIDTH = 240  # 1918 originally
+IMAGE_HEIGHT = 512  
+IMAGE_WIDTH = 512 
 PIN_MEMORY = True
 LOAD_MODEL = False
 TRAIN_IMG_DIR = '/home/axs2220/Math473_Final/Dataset/BCCD/train/original'
 TRAIN_MASK_DIR = '/home/axs2220/Math473_Final/Dataset/BCCD/train/mask'
 VAL_IMG_DIR = '/home/axs2220/Math473_Final/Dataset/BCCD/test/original'
+VAL_MASK_DIR = '/home/axs2220/Math473_Final/Dataset/BCCD/test/mask'
 
-def train_fn(loader, model, optimizer, loss_fn):  # Removed scaler
+def train_fn(loader, model, optimizer, scaler, device):
     loop = tqdm(loader)
-    for batch_idx, (data, targets) in enumerate(loop):
-        data = data.to(device=DEVICE)
-        targets = targets.float().unsqueeze(1).to(device=DEVICE)
+    total_loss = 0.0
 
-        # Forward pass
-        predictions = model(data)
-        loss = loss_fn(torch.sigmoid(predictions), targets)
+    for batch_idx, (data, targets) in enumerate(loop):
+        data = data.to(device)
+        if targets.dim() == 3:
+            targets = targets.unsqueeze(1)
+        targets = targets.to(device)
+
+        # Forward pass with AMP
+        with torch.cuda.amp.autocast():
+            predictions, batch_loss = model(data, targets)
+
+        # Debugging: Check prediction values
+        print(f"Predictions min: {predictions.min()}, max: {predictions.max()}")
+        print(f"Targets min: {targets.min()}, max: {targets.max()}")
 
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(batch_loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
-        # Update tqdm loop
-        loop.set_postfix(loss=loss.item())
+        total_loss += batch_loss.item()
+        loop.set_postfix(loss=batch_loss.item())
+
+    avg_loss = total_loss / len(loader)
+    print(f"Epoch Average Loss: {avg_loss}")
+
+    return avg_loss
 
 
-        
 def main():
+    # Data augmentation and preprocessing
     train_transform = A.Compose(
         [
-         A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
-         A.Rotate(limit=35, p=1.0),
-         A.HorizontalFlip(p=0.5),
-         A.VerticalFlip(p=0.1),
-         A.Normalize(
-             mean=[0.5, 0.5, 0.5],  # Adjusted mean
-             std=[0.5, 0.5, 0.5],    # Adjusted std
-             max_pixel_value=255.0,
-             ),
-             ToTensorV2(),
-             ],
-             )
-
-    val_transforms = A.Compose(
-        [
             A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
-            A.Normalize(
-                mean=[0.0, 0.0, 0.0],
-                std=[1.0, 1.0, 1.0],
-                max_pixel_value=255.0,
-            ),
+            A.Rotate(limit=35, p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.1),
+            A.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0], max_pixel_value=255.0),
             ToTensorV2(),
-        ],
+        ]
     )
 
-    model = TVRegularizedUNet(in_channels=3, out_channels=1).to(DEVICE)
-    
-    # Define loss function
-    loss_fn = nn.BCEWithLogitsLoss()
-    
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    val_transform = A.Compose(
+        [
+            A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
+            A.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0], max_pixel_value=255.0),
+            ToTensorV2(),
+        ]
+    )
+
+    # Initialize model
+    model = RegularizedUNet(
+        in_channels=3, 
+        num_classes=1, 
+        lambda_tv=0.1, 
+        lambda_pd=0.1
+    ).to(DEVICE)
+
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.1, patience=5, verbose=True
+    )
 
     train_loader = get_train_loader(
-        TRAIN_IMG_DIR,
-        TRAIN_MASK_DIR,
-        BATCH_SIZE,
-        train_transform,
-        NUM_WORKERS,
-        PIN_MEMORY,
+        TRAIN_IMG_DIR, TRAIN_MASK_DIR, BATCH_SIZE, train_transform, NUM_WORKERS, PIN_MEMORY
     )
     
     val_loader = get_val_loader(
-        VAL_IMG_DIR,
-        BATCH_SIZE,
-        val_transforms,
-        NUM_WORKERS,
-        PIN_MEMORY,
+        VAL_IMG_DIR, VAL_MASK_DIR, BATCH_SIZE, val_transform, NUM_WORKERS, PIN_MEMORY
     )
 
+    scaler = torch.cuda.amp.GradScaler()
 
-    
-    
-    print(f"Total training samples: {len(train_loader.dataset)}")
-    print(f"Total validation samples: {len(val_loader.dataset)}")
-
-    # Verify a batch of data
-    for batch_idx, (images, masks) in enumerate(train_loader):
-        print(f"Batch {batch_idx}")
-        print(f"Images shape: {images.shape}")
-        print(f"Masks shape: {masks.shape}")
-        print(f"Images dtype: {images.dtype}")
-        print(f"Masks dtype: {masks.dtype}")
-        
-        # Check for any NaNs or infs
-        print(f"Images NaNs: {torch.isnan(images).any()}")
-        print(f"Masks NaNs: {torch.isnan(masks).any()}")
-        print(f"Images infs: {torch.isinf(images).any()}")
-        print(f"Masks infs: {torch.isinf(masks).any()}")
-        
-        break  # Just check the first batch
-
-    # Training loop
+    best_val_loss = float('inf')
     for epoch in range(NUM_EPOCHS):
-        train_fn(train_loader, model, optimizer, loss_fn)
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        
+        # Training phase
+        model.train()
+        train_loss = train_fn(train_loader, model, optimizer, scaler, DEVICE)
 
-        # Save model checkpoint
-        checkpoint = {
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        }
-        save_checkpoint(checkpoint)
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for data, targets in val_loader:
+                data = data.to(DEVICE)
+                if targets.dim() == 3:  # [N, H, W]
+                    targets = targets.unsqueeze(1)
+                targets = targets.float().to(DEVICE)
 
-        # Generate and save predictions for validation images
+                _, batch_loss = model(data, targets)
+                val_loss += batch_loss.item()
+        
+        val_loss /= len(val_loader)
+        print(f"Validation Loss: {val_loss}")
+
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            checkpoint = {
+                "state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            save_checkpoint(checkpoint, filename=f"best_model_epoch_{epoch}.pth")
+
         save_predictions_as_imgs(
             val_loader, model, folder=f"saved_images/epoch_{epoch}/", device=DEVICE
         )
-        
+
+    print("Training complete!")
 
 if __name__ == "__main__":
     main()
