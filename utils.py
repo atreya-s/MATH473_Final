@@ -1,33 +1,46 @@
 import torch
 import torchvision
-from dataset import bccdDataset
-from torch.utils.data import DataLoader
 import os
 from PIL import Image
-from torch.utils.data import Dataset
 import numpy as np
+from torch.utils.data import Dataset, DataLoader
+
+from dataset import BCCDDataset  # Updated dataset class name
 
 def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
+    """
+    Save model checkpoint
+    """
     print("=> Saving checkpoint")
     torch.save(state, filename)
 
-def load_checkpoint(checkpoint, model):
+def load_checkpoint(checkpoint, model, optimizer=None):
+    """
+    Load model checkpoint
+    """
     print("=> Loading checkpoint")
     model.load_state_dict(checkpoint["state_dict"])
+    
+    if optimizer and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
 
 def get_loaders(
     train_dir,
     train_maskdir,
     val_dir,
+    val_maskdir,
     batch_size,
     train_transform,
     val_transform,
     num_workers=4,
     pin_memory=True,
 ):
-    train_ds = bccdDataset(
-        image_dir=train_dir,
-        mask_dir=train_maskdir,
+    """
+    Create train and validation data loaders
+    """
+    train_ds = BCCDDataset(
+        images_dir=train_dir,
+        masks_dir=train_maskdir,
         transform=train_transform,
     )
 
@@ -39,9 +52,9 @@ def get_loaders(
         shuffle=True,
     )
 
-    val_ds = bccdDataset(
-        image_dir=val_dir,
-        mask_dir=None,
+    val_ds = BCCDDataset(
+        images_dir=val_dir,
+        masks_dir=val_maskdir,  # Use masks_dir for validation
         transform=val_transform,
     )
 
@@ -64,7 +77,8 @@ def check_accuracy(loader, model, device="cuda"):
     with torch.no_grad():
         for x, y in loader:
             x = x.to(device)
-            y = y.to(device).unsqueeze(1)
+            # Ensure y has the right shape
+            y = y.float().unsqueeze(0).to(device)
             preds = torch.sigmoid(model(x))
             preds = (preds > 0.5).float()
             num_correct += (preds == y).sum()
@@ -82,13 +96,17 @@ def check_accuracy(loader, model, device="cuda"):
 def save_predictions_as_imgs(
     loader, model, folder="saved_images/", device="cuda"
 ):
+    """
+    Save model predictions as images
+    """
     model.eval()
     os.makedirs(folder, exist_ok=True)
     
-    for idx, x in enumerate(loader):
+    for idx, (x, _) in enumerate(loader):
         x = x.to(device)
         with torch.no_grad():
-            preds = torch.sigmoid(model(x))
+            preds, _ = model(x)  # Updated to match new model signature
+            preds = torch.sigmoid(preds)
             preds = (preds > 0.5).float()
         
         torchvision.utils.save_image(
@@ -96,46 +114,6 @@ def save_predictions_as_imgs(
         )
     
     model.train()
-
-def get_inference_loader(
-    image_dir,
-    batch_size,
-    transform,
-    num_workers=4,
-    pin_memory=True,
-):
-    dataset = InferenceDataset(  # You'll need to create this class
-        image_dir,
-        transform=transform,
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        shuffle=False,  # Keep False for inference
-    )
-
-    return loader
-
-class InferenceDataset(Dataset):
-    def __init__(self, image_dir, transform=None):
-        self.image_dir = image_dir
-        self.transform = transform
-        self.images = os.listdir(image_dir)
-    
-    def __len__(self):
-        return len(self.images)
-    
-    def __getitem__(self, index):
-        img_path = os.path.join(self.image_dir, self.images[index])
-        image = Image.open(img_path).convert("RGB")
-        
-        if self.transform is not None:
-            image = self.transform(image=np.array(image))["image"]
-            
-        return image
 
 def get_train_loader(
     train_dir,
@@ -145,9 +123,12 @@ def get_train_loader(
     num_workers=4,
     pin_memory=True,
 ):
-    train_ds = bccdDataset(
-        image_dir=train_dir,
-        mask_dir=train_maskdir,
+    """
+    Create training data loader
+    """
+    train_ds = BCCDDataset(
+        images_dir=train_dir,
+        masks_dir=train_maskdir,
         transform=train_transform,
     )
     
@@ -163,13 +144,18 @@ def get_train_loader(
 
 def get_val_loader(
     val_dir,
+    val_maskdir,
     batch_size,
     val_transform,
     num_workers=4,
     pin_memory=True,
 ):
-    val_ds = InferenceDataset(
-        image_dir=val_dir,
+    """
+    Create validation data loader
+    """
+    val_ds = BCCDDataset(
+        images_dir=val_dir,
+        masks_dir=val_maskdir,  # Use masks_dir for validation
         transform=val_transform,
     )
     
