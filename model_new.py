@@ -3,19 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TVRegularization(nn.Module):
-    """
-    Total Variation (TV) Regularization module
-    Implements the TV regularization as described in the paper
-    """
     def __init__(self, weight=1.0):
         super(TVRegularization, self).__init__()
         self.weight = weight
 
     def forward(self, x):
-        """
-        Compute Total Variation loss
-        x: Input tensor (typically network predictions)
-        """
+        # Ensure tensor has 4 dimensions
+        if x.dim() != 4:
+            raise ValueError(f"Input tensor must have 4 dimensions, got {x.shape}")
+
+        # Debugging: Print shape and sample values
+        print(f"Input tensor shape: {x.shape}")
+        print(f"Input tensor min: {x.min()}, max: {x.max()}")
+
+        # Clamp extreme values to prevent NaN/Inf
+        x = torch.clamp(x, min=-1e6, max=1e6)
+
         # Horizontal TV
         diff_h = torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])
         
@@ -27,45 +30,23 @@ class TVRegularization(nn.Module):
         
         return self.weight * tv_loss
 
+
 class PrimalDualRegularization(nn.Module):
-    """
-    Primal-Dual Regularization module
-    Implements the primal-dual optimization as described in the paper
-    """
     def __init__(self, lambda_pd=1.0, num_iterations=10):
         super(PrimalDualRegularization, self).__init__()
         self.lambda_pd = lambda_pd
         self.num_iterations = num_iterations
 
     def forward(self, x):
-        """
-        Apply primal-dual optimization
-        x: Input tensor (network predictions)
-        """
-        # Clone the original input as the initial primal variable
         primal = x.clone()
-        
-        # Initialize dual variable
         dual = torch.zeros_like(x)
-        
         for _ in range(self.num_iterations):
-            # Compute gradient of primal variable
             grad_primal = primal - x
-            
-            # Update dual variable with projection
-            dual = torch.clamp(dual + grad_primal, 
-                               min=-self.lambda_pd, 
-                               max=self.lambda_pd)
-            
-            # Update primal variable
+            dual = torch.clamp(dual + grad_primal, min=-self.lambda_pd, max=self.lambda_pd)
             primal = x - dual
-        
         return primal
 
 class RegularizedSegmentationLoss(nn.Module):
-    """
-    Combined loss function with data fidelity and regularization terms
-    """
     def __init__(self, lambda_tv=1.0, lambda_pd=1.0):
         super(RegularizedSegmentationLoss, self).__init__()
         self.cross_entropy = nn.CrossEntropyLoss()
@@ -73,68 +54,36 @@ class RegularizedSegmentationLoss(nn.Module):
         self.primal_dual_reg = PrimalDualRegularization(lambda_pd)
 
     def forward(self, predictions, targets):
-        """
-        Compute the regularized loss
-        predictions: Network output logits
-        targets: Ground truth segmentation masks
-        """
-        # Resize predictions to match targets if needed
-        if predictions.shape != targets.shape:
-            predictions = F.interpolate(
-                predictions, 
-                size=targets.shape[1:], 
-                mode='bilinear', 
-                align_corners=False
-            )
+        if targets.dim() == 4 and targets.shape[1] == 1:
+            targets = targets.squeeze(1)
+        targets = targets.long()
         
-        # Data fidelity term (Cross-Entropy Loss)
+        if predictions.shape[2:] != targets.shape[1:]:
+            predictions = F.interpolate(predictions, size=targets.shape[1:], mode='bilinear', align_corners=False)
         data_loss = self.cross_entropy(predictions, targets)
-        
-        # Total Variation regularization
         tv_loss = self.tv_regularization(predictions)
-        
-        # Combine losses
         total_loss = data_loss + tv_loss
-        
         return total_loss
 
 class RegularizedUNet(nn.Module):
-    """
-    U-Net architecture with TV and Primal-Dual regularization
-    """
-    def __init__(self, 
-                 in_channels=3, 
-                 num_classes=2, 
-                 base_channels=64,
-                 lambda_tv=1.0, 
-                 lambda_pd=1.0):
+    def __init__(self, in_channels=3, num_classes=2, base_channels=64, lambda_tv=1.0, lambda_pd=1.0):
         super(RegularizedUNet, self).__init__()
-        
-        # Encoder path
         self.encoder1 = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True)
         )
         self.encoder2 = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels*2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_channels*2),
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels * 2),
             nn.ReLU(inplace=True)
         )
-        
-        # Decoder path
         self.decoder1 = nn.Sequential(
-            nn.ConvTranspose2d(base_channels*2, base_channels, kernel_size=2, stride=2),
+            nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True)
         )
         self.final_conv = nn.Conv2d(base_channels, num_classes, kernel_size=1)
-        
-        # Regularization modules
-        self.tv_regularization = TVRegularization(weight=lambda_tv)
-        self.primal_dual_reg = PrimalDualRegularization(lambda_pd)
-        
-        # Loss function
         self.loss_fn = RegularizedSegmentationLoss(lambda_tv, lambda_pd)
 
     def forward(self, x, targets=None):
@@ -145,40 +94,27 @@ class RegularizedUNet(nn.Module):
         # Decoder
         x = self.decoder1(x2)
         x = self.final_conv(x)
-        
-        # Primal-dual regularization
-        x = self.primal_dual_reg(x)
-        
+    
+        # Normalize predictions
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Restrict values to a reasonable range
+    
         # Compute loss if targets are provided
         if targets is not None:
             loss = self.loss_fn(x, targets)
             return x, loss
-        
+            
         return x
+    
+    def initialize_weights(module):
+    if isinstance(module, nn.Conv2d) or isinstance(module, nn.ConvTranspose2d):
+        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+    elif isinstance(module, nn.BatchNorm2d):
+        nn.init.constant_(module.weight, 1)
+        nn.init.constant_(module.bias, 0)
 
-# Example usage
-if __name__ == "__main__":
-    # Initialize the regularized U-Net
-    model = RegularizedUNet(
-        in_channels=3, 
-        num_classes=2, 
-        lambda_tv=0.1, 
-        lambda_pd=0.1
-    )
-    
-    # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
-    # Dummy data
-    inputs = torch.rand(1, 3, 256, 256)
-    targets = torch.randint(0, 2, (1, 256, 256))
-    
-    # Training step
-    model.train()
-    optimizer.zero_grad()
-    outputs, loss = model(inputs, targets)
-    loss.backward()
-    optimizer.step()
-    
-    
-    print(f"Loss: {loss.item()}")
+    # Apply initialization in the UNet constructor
+    self.apply(initialize_weights)
+
+
